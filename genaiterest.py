@@ -3,9 +3,21 @@ from PIL import Image
 from io import BytesIO
 from base64 import b64encode, b64decode
 import time
+import threading
+import queue
+import random
 
 # Let's import the OctoAI Python SDK
 from octoai.client import Client
+
+# Init OctoAI endpoint
+client = Client()
+
+# List of prompt entries to synthesize with SDXL
+prompts = queue.Queue()
+
+# SDXL futures
+sdxl_futures = queue.Queue()
 
 # SDXL styles
 sdxl_styles = {
@@ -59,80 +71,125 @@ def encode_image(image: Image) -> str:
     im_base64 = b64encode(buffer.getvalue()).decode("utf-8")
     return im_base64
 
+
 # A helper function that reads a base64 encoded string and returns a PIL Image object
 def decode_image(image_str: str) -> Image:
     return Image.open(BytesIO(b64decode(image_str)))
 
-def generate_gallery(interests):
 
-    # Init OctoAI endpoint
-    client = Client()
+def get_prompts(interests, num_prompts):
+    # Async call to Llama 2
+    futures = []
+    for interest in interests:
+        # Ask LLAMA for n subject ideas
+        llama_inputs = {
+            "model": "llama-2-7b-chat",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Below is an instruction that describes a task. Write a response that appropriately completes the request."
+                },
+                {
+                    "role": "user",
+                    "content": "Provide a list of {} {} photography subjects, 7 words max per line, no numbering".format(num_prompts, interest)
+                }
+            ],
+            "stream": False,
+            "max_tokens": 300
+        }
+        # Send to Llama 2 endpoint
+        future = client.infer_async(endpoint_url="https://ga-demo-llama27b-4jkxk521l3v1.octoai.run/v1/chat/completions", inputs=llama_inputs)
+        futures.append((future, interest))
 
-    # Gallery columns
-    col1, col2, col3, col4, col5 = st.columns(5)
-    cols = [col1, col2, col3, col4, col5]
+    # Read the inputs back
+    while len(futures):
+        for future, interest in futures:
+            if client.is_future_ready(future):
+                outputs = client.get_future_result(future)
+                llama2_response = outputs.get('choices')[0].get("message").get('content')
+                # Derive the prompt list
+                prompt_list = llama2_response.split('\n')
+                # Do some cleaning
+                for p in prompt_list:
+                    p = p.lstrip('0123456789.- ')
+                    if p != "" and "ere are" not in p:
+                        prompts.put({
+                            "prompt": p,
+                            "style": interest
+                        })
+                # Remove futures tuple
+                futures.remove((future, interest))
+        time.sleep(.1)
+
+
+def launch_imagen():
 
     SDXL_payload = {
         "prompt": "A photo of an octopus playing chess",
         "negative_prompt":"Blurry photo, distortion, low-res, bad quality",
         "style_preset":"",
         "cfg_scale":7.5,
-        "steps":20
+        "steps":20,
+        "seed": random.randint(0, 1024)
     }
 
-    # For number of images
-    num_images = 10
+    while True:
+        p = prompts.get()
+        prompt = p["prompt"]
+        style = p["style"]
+        SDXL_payload["prompt"] = sdxl_styles[style]["prompt"].replace("{prompt}", prompt)
+        SDXL_payload["negative_prompt"] = sdxl_styles[style]["negative_prompt"]
+        future = client.infer_async(
+            endpoint_url="https://ga-demo-sdxl-4jkxk521l3v1.octoai.run/predict",
+            inputs=SDXL_payload
+        )
+        sdxl_futures.put({
+            "future": future,
+            "prompt": prompt
+        })
+        print("Launched SDXL to generate: {}".format(prompt))
 
-    # Async call
-    futures = []
-    for i in range(0, len(interests)):
-        # Derive Category
-        category = interests[i]
-        # Ask LLAMA for n subject ideas
-        llama_inputs = {
-            "model": "llama-2-13b-chat",
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": "Below is an instruction that describes a task. Write a response that appropriately completes the request."},
-                {
-                    "role": "user",
-                    "content": "Provide a consise list of {} {} photography subjects, 12 words per item at most".format(num_images, category)
-                }
-            ],
-            "stream": False,
-            "max_tokens": 512
-        }
-        # Send to LLAMA endpoint and do some post processing on the response stream
-        outputs = client.infer(endpoint_url="https://ga-demo-llama2-4jkxk521l3v1.octoai.run/v1/chat/completions", inputs=llama_inputs)
 
-        # Get the Llama 2 output
-        categories = outputs.get('choices')[0].get("message").get('content')
-        # Derive the prompt list (only 10 items)
-        prompt_list = categories.split('\n')[2:12]
-        # Remove the bullet point numbering
-        prompt_list = [x.split('. ')[1] for x in prompt_list]
-        for p in prompt_list:
-            print(p)
+def get_imagen():
 
-        for j in range(0, num_images):
-            SDXL_payload["prompt"] = sdxl_styles[category]["prompt"].replace("{prompt}", prompt_list[j])
-            SDXL_payload["negative_prompt"] = sdxl_styles[category]["negative_prompt"]
-            future = client.infer_async(
-                endpoint_url="https://ga-demo-sdxl-4jkxk521l3v1.octoai.run/predict",
-                inputs=SDXL_payload
+    col1, col2, col3 = st.columns(3)
+    cols = [col1, col2, col3]
+
+    i = 0
+    while True:
+        sdxl_future = sdxl_futures.get()
+        future = sdxl_future["future"]
+        prompt = sdxl_future["prompt"]
+        if client.is_future_ready(future):
+            result = client.get_future_result(future)
+            cols[i%len(cols)].image(
+                decode_image(result["completion"]["image_0"]),
+                caption=prompt
             )
-            futures.append(future)
+            i += 1
+            print("Finished SDXL generation of: {}".format(prompt))
+        else:
+            sdxl_futures.put(sdxl_future)
 
-        img_idx = 0
-        while len(futures):
-            for future in futures:
-                if client.is_future_ready(future):
-                    result = client.get_future_result(future)
-                    cols[img_idx % len(cols)].image(decode_image(result["completion"]["image_0"]))
-                    futures.remove(future)
-                    img_idx += 1
-            time.sleep(.1)
+
+def generate_gallery(interests, num_images=18):
+
+    # Start the threads to do image gen async
+    t1 = threading.Thread(target=launch_imagen)
+    t2 = threading.Thread(target=get_imagen)
+    st.runtime.scriptrunner.add_script_run_ctx(t1)
+    st.runtime.scriptrunner.add_script_run_ctx(t2)
+    t1.start()
+    t2.start()
+
+    # Generate the prompts
+    get_prompts(interests, num_images)
+
+    # Wait for it all to finish
+    prompts.join()
+    sdxl_futures.join()
+    print('All work completed')
+
 
 st.set_page_config(layout="wide", page_title="GenAIterest")
 
