@@ -1,2 +1,2 @@
 # genaiterest
-A website lik pinterest but entirely GenAI based
+A website like pinterest but entirely GenAI based
